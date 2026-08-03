@@ -5,6 +5,5 @@ feedparser
 requests
 beautifulsoup4
 wordcloud
-matplotlib
-Pillow2
+Pillow
 python-dateutil
