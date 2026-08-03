@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+feedparser
+requests
+beautifulsoup4
+wordcloud
+matplotlib
+Pillow2
+python-dateutil
