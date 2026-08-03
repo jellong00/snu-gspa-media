@@ -23,7 +23,7 @@ ARTICLES_FILE = DATA_DIR / "articles.csv"
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "title", "summary", "body", "author", "metadata_text", "publisher", "url", "final_url", "search_query", "source",
     "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 PROFESSOR_COLUMNS = [
@@ -37,7 +37,7 @@ PROFESSOR_ALIASES = {
 }
 
 TYPE_RULES = {
-    "기고·칼럼": ["기고", "칼럼", "시론", "오피니언", "특별기고"],
+    "기고·칼럼": ["기고", "칼럼", "시론", "시평", "논단", "오피니언", "특별기고", "필자"],
     "인터뷰": ["인터뷰", "대담", "일문일답", "만나봤", "초대석"],
     "방송 출연": ["출연", "라디오", "방송", "뉴스특보", "유튜브", "영상"],
     "전문가 인용": ["교수는", "원장은", "전문가는", "진단했다", "지적했다", "설명했다", "분석했다", "전망했다", "강조했다", "밝혔다", "말했다"],
@@ -79,6 +79,9 @@ OTHER_SNU_UNITS = [
     "수의과대학", "수의대", "보건대학원", "국제대학원", "환경대학원", "치의학대학원",
     "융합과학기술대학원", "데이터사이언스대학원", "농경제사회학부", "경제학부", "정치외교학부",
     "사회학과", "언론정보학과", "심리학과", "법학과", "의학과", "컴퓨터공학부",
+    "지구환경과학부", "지구환경과학과", "물리천문학부", "화학부", "생명과학부",
+    "수리과학부", "통계학과", "지리학과", "경제학부", "정치외교학부", "인류학과",
+    "사회복지학과", "소비자학과", "식품영양학과", "아동가족학과", "건축학과",
 ]
 OTHER_ORGANIZATION_TERMS = [
     "주식회사", "㈜", "기업", "그룹", "재단", "협회", "연합회", "조합", "법무법인",
@@ -170,38 +173,23 @@ def affiliation_match(
     external_position: str = "",
     known_affiliations: str = "",
 ) -> tuple[bool, str]:
-    """모든 교수에게 동일한 소속 검증을 적용한다.
+    """전 교수 공통 소속 검증.
 
-    이름만 일치하는 기사는 수집하지 않는다. 행정대학원, 등록된 외부직책,
-    또는 이름 주변의 서울대+행정/정책 전공 근거가 있어야 한다.
+    구체적인 타 소속은 일반적인 '서울대 교수' 표기보다 우선한다. 단, 이름과 가까운
+    위치에 행정대학원 또는 CSV에 등록된 실제 외부직책이 명시되면 해당 교수로 인정한다.
+    작성자·필자·사진 캡션·프로필 텍스트도 ``text``에 포함되어 동일하게 판정한다.
     """
     lowered = text.lower()
-    near = nearby_text(name, text, radius=220)
+    near = nearby_text(name, text, radius=360)
     near_lower = near.lower()
-    has_name = name.lower() in lowered
-    if not has_name:
+    if name.lower() not in lowered:
         return False, "교수명 없음"
 
-    has_gspa = any(term.lower() in near_lower for term in GSPA_TERMS)
     allowed_external = _allowed_external_terms(external_position, known_affiliations)
+    has_gspa = any(term.lower() in near_lower for term in GSPA_TERMS)
     has_allowed_external = any(term.lower() in near_lower for term in allowed_external)
 
-    # "고길곤 서울대 교수", "서울대 교수 고길곤", "서울대 고길곤 교수"처럼
-    # 행정대학원 명칭이 생략된 통상적인 언론 표기도 명확한 긍정 근거로 인정한다.
-    escaped_name = re.escape(name)
-    snu_professor_patterns = [
-        rf"{escaped_name}\s*(?:서울대학교|서울대)\s*교수",
-        rf"(?:서울대학교|서울대)\s*교수\s*{escaped_name}",
-        rf"(?:서울대학교|서울대)\s*{escaped_name}\s*교수",
-    ]
-    has_snu_professor = any(re.search(pattern, near, flags=re.IGNORECASE) for pattern in snu_professor_patterns)
-
-    has_snu_near = "서울대" in near or "서울대학교" in near
-    academic_hits = sum(
-        1 for term in list(search_terms) + PUBLIC_ADMIN_TERMS
-        if term and term.lower() in near_lower
-    )
-
+    # 이름 주변에서 구체적인 타 대학·서울대 타 단과대·타 기관 소속을 먼저 탐지한다.
     other_univ_near = any(term.lower() in near_lower for term in OTHER_UNIVERSITIES)
     other_snu_unit_near = any(term.lower() in near_lower for term in OTHER_SNU_UNITS)
     other_org_near = any(term.lower() in near_lower for term in OTHER_ORGANIZATION_TERMS)
@@ -212,24 +200,31 @@ def affiliation_match(
     if organization_pattern.search(near) and not has_allowed_external:
         other_org_near = True
 
-    # 명시적인 행정대학원·서울대 교수 표기 또는 등록된 실제 외부직책은 우선 인정한다.
-    # 같은 기사에 다른 기관 인사가 함께 언급돼도 해당 교수의 명확한 소속 근거가 있으면 제외하지 않는다.
+    # 가장 구체적인 긍정 근거가 있으면 인정한다.
     if has_gspa:
         return True, "행정대학원 소속 확인"
-    if has_snu_professor:
-        return True, "서울대 교수 소속 확인"
     if has_allowed_external:
         return True, "등록된 현재·과거 외부직책 확인"
 
-    # 명확한 긍정 근거가 없을 때만 다른 대학·단과대·기관 소속을 배제한다.
-    if not has_gspa and not has_allowed_external:
-        if other_univ_near:
-            return False, "다른 대학 소속"
-        if other_snu_unit_near:
-            return False, "서울대 다른 학부·대학원 소속"
-        if other_org_near:
-            return False, "다른 기업·연구원·기관·직업 소속"
+    # 구체적 타 소속은 '서울대 교수'라는 일반 표기보다 우선한다.
+    if other_univ_near:
+        return False, "다른 대학 소속"
+    if other_snu_unit_near:
+        return False, "서울대 다른 학부·대학원 소속"
+    if other_org_near:
+        return False, "다른 기업·연구원·기관·직업 소속"
 
+    escaped_name = re.escape(name)
+    snu_professor_patterns = [
+        rf"{escaped_name}\s*(?:서울대학교|서울대)\s*교수",
+        rf"(?:서울대학교|서울대)\s*교수\s*{escaped_name}",
+        rf"(?:서울대학교|서울대)\s*{escaped_name}\s*교수",
+    ]
+    if any(re.search(pattern, near, flags=re.IGNORECASE) for pattern in snu_professor_patterns):
+        return True, "서울대 교수 소속 확인"
+
+    has_snu_near = "서울대" in near or "서울대학교" in near
+    academic_hits = sum(1 for term in list(search_terms) + PUBLIC_ADMIN_TERMS if term and term.lower() in near_lower)
     if has_snu_near and academic_hits >= 1:
         return True, "서울대 및 행정·정책 전공 근거 확인"
     return False, "행정대학원 소속 근거 부족"
@@ -270,7 +265,11 @@ def build_queries(row: pd.Series) -> list[str]:
     topic_part = " OR ".join(f'"{term}"' for term in terms[:6])
     topic = f'"{name}" ("서울대학교" OR "서울대") ({topic_part})' if topic_part else affiliation
     broad = f'"{name}"'
-    return list(dict.fromkeys([affiliation, topic, broad]))
+    author_queries = [
+        f'"{name}" (기고 OR 칼럼 OR 시평 OR 오피니언 OR 필자)',
+        f'"{name}" (서울대 교수 OR 서울대학교 교수)',
+    ]
+    return list(dict.fromkeys([affiliation, topic, broad] + author_queries))
 
 
 def build_backfill_queries(row: pd.Series, start_year: int = 2018) -> list[str]:
@@ -330,8 +329,103 @@ def _external_url_from_google_html(html_text: str, base_url: str) -> str:
             return candidate
     return ""
 
+def _flatten_jsonld_authors(value) -> list[str]:
+    names: list[str] = []
+    if isinstance(value, str):
+        if value.strip():
+            names.append(value.strip())
+    elif isinstance(value, dict):
+        for key in ("name", "alternateName"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                names.append(item.strip())
+        for key in ("author", "creator"):
+            names.extend(_flatten_jsonld_authors(value.get(key)))
+    elif isinstance(value, list):
+        for item in value:
+            names.extend(_flatten_jsonld_authors(item))
+    return names
+
+
+def extract_page_metadata(html_text: str) -> tuple[str, str]:
+    """기사 작성자·필자 소개·사진 캡션·구조화 데이터에서 보조 텍스트를 추출한다."""
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    authors: list[str] = []
+    metadata_parts: list[str] = []
+
+    meta_selectors = [
+        ("meta[name='author']", "content"),
+        ("meta[property='article:author']", "content"),
+        ("meta[name='byl']", "content"),
+        ("meta[name='parsely-author']", "content"),
+        ("meta[name='dable:author']", "content"),
+    ]
+    for selector, attr in meta_selectors:
+        for node in soup.select(selector):
+            value = clean_text(node.get(attr, ""))
+            if value:
+                authors.append(value)
+                metadata_parts.append(value)
+
+    for script in soup.select("script[type='application/ld+json']"):
+        raw = script.string or script.get_text(" ")
+        if not raw.strip():
+            continue
+        try:
+            import json
+            data = json.loads(raw)
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("@graph"), list):
+                items.extend(item["@graph"])
+            if not isinstance(item, dict):
+                continue
+            names = _flatten_jsonld_authors(item.get("author")) + _flatten_jsonld_authors(item.get("creator"))
+            authors.extend(names)
+            for key in ("headline", "description", "articleSection"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    metadata_parts.append(value.strip())
+
+    selectors = [
+        "[class*='author']", "[class*='byline']", "[class*='writer']", "[class*='reporter']",
+        "[id*='author']", "[id*='byline']", "[id*='writer']", "[id*='reporter']",
+        "[rel='author']", "figure figcaption", "figcaption", "[class*='caption']",
+        "[class*='profile']", "[class*='contributor']", "[class*='columnist']",
+    ]
+    seen_nodes: set[str] = set()
+    for selector in selectors:
+        for node in soup.select(selector)[:40]:
+            value = clean_text(node.get_text(" "))
+            if 2 <= len(value) <= 500 and value not in seen_nodes:
+                seen_nodes.add(value)
+                metadata_parts.append(value)
+                if any(token in selector for token in ("author", "byline", "writer", "reporter", "columnist", "contributor")):
+                    authors.append(value)
+
+    # 본문 상단·하단에 흔한 필자 표기까지 보조적으로 수집한다.
+    full_text = clean_text(soup.get_text(" "))
+    patterns = [
+        r"(?:글|필자|작성|기고|칼럼)\s*[:：]?\s*([가-힣A-Za-z· ]{2,40})",
+        r"([가-힣]{2,5})\s*(?:서울대학교|서울대)\s*행정대학원\s*교수",
+        r"([가-힣]{2,5})\s*교수\s*[|·,-]?\s*(?:서울대학교|서울대)\s*행정대학원",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, full_text, flags=re.IGNORECASE):
+            value = clean_text(match.group(0))
+            if value:
+                metadata_parts.append(value)
+                authors.append(clean_text(match.group(1)))
+
+    author_text = "; ".join(dict.fromkeys(x for x in authors if x))[:1000]
+    metadata_text = " ".join(dict.fromkeys(x for x in metadata_parts if x))[:12000]
+    return author_text, metadata_text
+
+
 def resolve_and_extract_body(url: str, timeout: int = 18) -> dict:
-    result = {"final_url": url, "body": "", "body_status": "추출 실패", "body_char_count": 0}
+    result = {"final_url": url, "body": "", "author": "", "metadata_text": "", "body_status": "추출 실패", "body_char_count": 0}
     if not url:
         result["body_status"] = "URL 없음"
         return result
@@ -349,6 +443,9 @@ def resolve_and_extract_body(url: str, timeout: int = 18) -> dict:
                 html_text = response.text
         result["final_url"] = final_url
         content_type = response.headers.get("content-type", "").lower()
+        author, metadata_text = extract_page_metadata(html_text)
+        result["author"] = author
+        result["metadata_text"] = metadata_text
         if "html" not in content_type and not html_text.lstrip().startswith("<"):
             result["body_status"] = "HTML 아님"
             return result
@@ -377,8 +474,8 @@ def resolve_and_extract_body(url: str, timeout: int = 18) -> dict:
         result["body_status"] = f"추출 오류: {type(exc).__name__}"
     return result
 
-def content_text(title: str, summary: str, body: str) -> str:
-    return f"{title or ''} {summary or ''} {body or ''}".strip()
+def content_text(title: str, summary: str, body: str, author: str = "", metadata_text: str = "") -> str:
+    return f"{title or ''} {summary or ''} {author or ''} {metadata_text or ''} {body or ''}".strip()
 
 def normalize_title(title: str) -> str:
     title = re.sub(r"\s*[-|–—]\s*[^-|–—]{2,30}$", "", title)
@@ -404,15 +501,15 @@ def load_existing() -> pd.DataFrame:
     return df[ARTICLE_COLUMNS]
 
 
-def make_row(target_name: str, title: str, summary: str, body: str, publisher: str, published_at: str, url: str, final_url: str,
+def make_row(target_name: str, title: str, summary: str, body: str, author: str, metadata_text: str, publisher: str, published_at: str, url: str, final_url: str,
              body_status: str, body_char_count: int, query: str, collected_at: str, score: int, review_status: str) -> dict:
-    combined = content_text(title, summary, body)
+    combined = content_text(title, summary, body, author, metadata_text)
     ckey = canonical_key(title, published_at)
     mention_type = classify_type(combined)
     return {
         "article_id": article_id(target_name, ckey), "canonical_key": ckey,
         "professor_name": target_name, "published_at": published_at, "collected_at": collected_at,
-        "title": title, "summary": summary, "body": body, "publisher": publisher, "url": url, "final_url": final_url or url,
+        "title": title, "summary": summary, "body": body, "author": author, "metadata_text": metadata_text, "publisher": publisher, "url": url, "final_url": final_url or url,
         "search_query": query, "source": "Google News RSS + 원문", "body_status": body_status, "body_char_count": body_char_count, "mention_type": mention_type,
         "topic": classify_topics(combined), "relevance_score": score,
         "review_status": review_status, "media_weight": TYPE_WEIGHT.get(mention_type, 0.5),
@@ -426,7 +523,7 @@ def clean_existing(existing: pd.DataFrame, professors: pd.DataFrame) -> pd.DataF
     kept = []
     for _, row in existing.iterrows():
         name = str(row["professor_name"]).strip()
-        combined = content_text(row.get("title", ""), row.get("summary", ""), row.get("body", ""))
+        combined = content_text(row.get("title", ""), row.get("summary", ""), row.get("body", ""), row.get("author", ""), row.get("metadata_text", ""))
         row = row.copy()
         row["topic"] = classify_topics(combined)
         row["mention_type"] = classify_type(combined)
@@ -527,7 +624,7 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
             try:
                 extraction_cache[url] = future.result()
             except Exception as exc:
-                extraction_cache[url] = {"final_url": url, "body": "", "body_status": f"추출 오류: {type(exc).__name__}", "body_char_count": 0}
+                extraction_cache[url] = {"final_url": url, "body": "", "author": "", "metadata_text": "", "body_status": f"추출 오류: {type(exc).__name__}", "body_char_count": 0}
 
     rows: list[dict] = []
     known_ids: set[str] = set()
@@ -538,12 +635,12 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
         external_position = str(professor.get("external_position", "")).strip()
         known_affiliations = str(professor.get("known_affiliations", "")).strip()
         for candidate in pool.values():
-            ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "body_status": "미수집", "body_char_count": 0})
-            combined = content_text(candidate["title"], candidate["summary"], ext["body"])
+            ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "author": "", "metadata_text": "", "body_status": "미수집", "body_char_count": 0})
+            combined = content_text(candidate["title"], candidate["summary"], ext["body"], ext.get("author", ""), ext.get("metadata_text", ""))
             score, _ = relevance_score(name, combined, terms, excludes, external_position, known_affiliations)
             if score < 45:
                 continue
-            row = make_row(name, candidate["title"], candidate["summary"], ext["body"], candidate["publisher"],
+            row = make_row(name, candidate["title"], candidate["summary"], ext["body"], ext.get("author", ""), ext.get("metadata_text", ""), candidate["publisher"],
                            candidate["published_at"], candidate["url"], ext["final_url"], ext["body_status"],
                            ext["body_char_count"], candidate["query"], collected_at, score,
                            "관련" if score >= 70 else "검토 필요")
@@ -552,8 +649,8 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
 
     professor_names = professors["name"].tolist()
     for candidate in institution_pool.values():
-        ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "body_status": "미수집", "body_char_count": 0})
-        combined = content_text(candidate["title"], candidate["summary"], ext["body"])
+        ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "author": "", "metadata_text": "", "body_status": "미수집", "body_char_count": 0})
+        combined = content_text(candidate["title"], candidate["summary"], ext["body"], ext.get("author", ""), ext.get("metadata_text", ""))
         if not any(term in combined for term in GSPA_TERMS):
             continue
         validated = []
@@ -567,7 +664,7 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
                 validated.append((target, score))
         targets = validated or [("대학원 전체", 100)]
         for target, score in targets:
-            row = make_row(target, candidate["title"], candidate["summary"], ext["body"], candidate["publisher"],
+            row = make_row(target, candidate["title"], candidate["summary"], ext["body"], ext.get("author", ""), ext.get("metadata_text", ""), candidate["publisher"],
                            candidate["published_at"], candidate["url"], ext["final_url"], ext["body_status"],
                            ext["body_char_count"], candidate["query"], collected_at, score, "관련")
             if row["article_id"] not in known_ids:
