@@ -56,8 +56,8 @@ def load_professors(path):
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "publisher", "url", "search_query", "source",
-    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
+    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
 def load_articles_file(path):
@@ -80,7 +80,7 @@ def load_data():
 
 
 def run_collection():
-    return subprocess.run([sys.executable, str(BASE_DIR / "collect_news.py")], cwd=BASE_DIR, capture_output=True, text=True, timeout=300)
+    return subprocess.run([sys.executable, str(BASE_DIR / "collect_news.py")], cwd=BASE_DIR, capture_output=True, text=True, timeout=1800)
 
 
 FONT_URLS = [
@@ -114,7 +114,7 @@ def keyword_table(df, professor_names):
         return pd.DataFrame(columns=["키워드", "빈도", "관련 기사 수"])
     names = set(professor_names)
     token_rows = []
-    for idx, text in enumerate((df["title"] + " " + df["summary"]).fillna("")):
+    for idx, text in enumerate((df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["body"].fillna(""))):
         tokens = [w for w in re.findall(r"[가-힣A-Za-z]{2,}", text) if w not in STOPWORDS and w not in names]
         for word in tokens:
             token_rows.append((idx, word))
@@ -127,7 +127,7 @@ def keyword_table(df, professor_names):
 
 professors, articles = load_data()
 st.title("서울대학교 행정대학원 언론 모니터링")
-st.caption("Google 뉴스 RSS 기반 시범 대시보드 · 기사 제목과 RSS 요약을 중심으로 분석")
+st.caption("Google 뉴스 RSS 후보 수집 + 언론사 원문 본문 추출 기반 분석")
 
 if articles.empty:
     st.info("최초 실행 상태입니다. 기사 데이터를 자동으로 수집합니다.")
