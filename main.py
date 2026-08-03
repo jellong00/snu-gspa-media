@@ -56,7 +56,7 @@ def load_professors(path):
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "title", "summary", "body", "author", "metadata_text", "publisher", "url", "final_url", "search_query", "source",
     "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
@@ -114,7 +114,7 @@ def keyword_table(df, professor_names):
         return pd.DataFrame(columns=["키워드", "빈도", "관련 기사 수"])
     names = set(professor_names)
     token_rows = []
-    for idx, text in enumerate((df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["body"].fillna(""))):
+    for idx, text in enumerate((df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["author"].fillna("") + " " + df["metadata_text"].fillna("") + " " + df["body"].fillna(""))):
         tokens = [w for w in re.findall(r"[가-힣A-Za-z]{2,}", text) if w not in STOPWORDS and w not in names]
         for word in tokens:
             token_rows.append((idx, word))
