@@ -4,12 +4,15 @@ import hashlib
 import html
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import feedparser
 import pandas as pd
+import requests
+import trafilatura
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
@@ -20,8 +23,8 @@ ARTICLES_FILE = DATA_DIR / "articles.csv"
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "publisher", "url", "search_query", "source",
-    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
+    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 PROFESSOR_COLUMNS = [
     "professor_id", "name_en", "name", "rank", "position", "status",
@@ -242,7 +245,8 @@ def build_queries(row: pd.Series) -> list[str]:
     affiliation = f'"{name}" ("서울대학교 행정대학원" OR "서울대 행정대학원" OR "행정대학원")'
     topic_part = " OR ".join(f'"{term}"' for term in terms[:6])
     topic = f'"{name}" ("서울대학교" OR "서울대") ({topic_part})' if topic_part else affiliation
-    return list(dict.fromkeys([affiliation, topic]))
+    broad = f'"{name}"'
+    return list(dict.fromkeys([affiliation, topic, broad]))
 
 
 def build_institution_queries() -> list[str]:
@@ -260,6 +264,83 @@ def fetch_feed(query: str, max_items: int = 100) -> list[dict]:
         raise RuntimeError(str(getattr(feed, "bozo_exception", "RSS parsing failed")))
     return list(feed.entries[:max_items])
 
+
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+}
+
+def _external_url_from_google_html(html_text: str, base_url: str) -> str:
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    candidates = []
+    for selector, attr in [("link[rel='canonical']", "href"), ("meta[property='og:url']", "content")]:
+        node = soup.select_one(selector)
+        if node and node.get(attr):
+            candidates.append(node.get(attr))
+    refresh = soup.select_one("meta[http-equiv='refresh']")
+    if refresh and refresh.get("content"):
+        match = re.search(r"url=(.+)$", refresh.get("content"), re.I)
+        if match:
+            candidates.append(match.group(1).strip(" '\""))
+    for a in soup.select("a[href]"):
+        candidates.append(urljoin(base_url, a.get("href")))
+    for candidate in candidates:
+        parsed = urlparse(candidate)
+        host = parsed.netloc.lower()
+        if parsed.scheme in {"http", "https"} and host and "google." not in host and "gstatic." not in host:
+            return candidate
+    return ""
+
+def resolve_and_extract_body(url: str, timeout: int = 18) -> dict:
+    result = {"final_url": url, "body": "", "body_status": "추출 실패", "body_char_count": 0}
+    if not url:
+        result["body_status"] = "URL 없음"
+        return result
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+        response.raise_for_status()
+        final_url = response.url
+        html_text = response.text
+        if "news.google." in urlparse(final_url).netloc.lower():
+            external = _external_url_from_google_html(html_text, final_url)
+            if external:
+                response = requests.get(external, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+                response.raise_for_status()
+                final_url = response.url
+                html_text = response.text
+        result["final_url"] = final_url
+        content_type = response.headers.get("content-type", "").lower()
+        if "html" not in content_type and not html_text.lstrip().startswith("<"):
+            result["body_status"] = "HTML 아님"
+            return result
+        body = trafilatura.extract(
+            html_text, url=final_url, include_comments=False, include_tables=False,
+            favor_precision=True, deduplicate=True, output_format="txt"
+        ) or ""
+        body = clean_text(body)
+        if len(body) < 180:
+            soup = BeautifulSoup(html_text, "html.parser")
+            for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "aside", "form"]):
+                tag.decompose()
+            container = soup.find("article") or soup.find("main") or soup.body
+            paragraphs = [clean_text(x.get_text(" ")) for x in container.find_all("p")] if container else []
+            fallback = " ".join(x for x in paragraphs if len(x) >= 20)
+            if len(fallback) > len(body):
+                body = fallback
+        body = re.sub(r"\s+", " ", body).strip()[:50000]
+        if len(body) >= 180:
+            result.update(body=body, body_status="추출 성공", body_char_count=len(body))
+        else:
+            result.update(body=body, body_status="본문 부족", body_char_count=len(body))
+    except requests.RequestException as exc:
+        result["body_status"] = f"접속 실패: {type(exc).__name__}"
+    except Exception as exc:
+        result["body_status"] = f"추출 오류: {type(exc).__name__}"
+    return result
+
+def content_text(title: str, summary: str, body: str) -> str:
+    return f"{title or ''} {summary or ''} {body or ''}".strip()
 
 def normalize_title(title: str) -> str:
     title = re.sub(r"\s*[-|–—]\s*[^-|–—]{2,30}$", "", title)
@@ -285,16 +366,16 @@ def load_existing() -> pd.DataFrame:
     return df[ARTICLE_COLUMNS]
 
 
-def make_row(target_name: str, title: str, summary: str, publisher: str, published_at: str, url: str,
-             query: str, collected_at: str, score: int, review_status: str) -> dict:
-    combined = f"{title} {summary}"
+def make_row(target_name: str, title: str, summary: str, body: str, publisher: str, published_at: str, url: str, final_url: str,
+             body_status: str, body_char_count: int, query: str, collected_at: str, score: int, review_status: str) -> dict:
+    combined = content_text(title, summary, body)
     ckey = canonical_key(title, published_at)
     mention_type = classify_type(combined)
     return {
         "article_id": article_id(target_name, ckey), "canonical_key": ckey,
         "professor_name": target_name, "published_at": published_at, "collected_at": collected_at,
-        "title": title, "summary": summary, "publisher": publisher, "url": url,
-        "search_query": query, "source": "Google News RSS", "mention_type": mention_type,
+        "title": title, "summary": summary, "body": body, "publisher": publisher, "url": url, "final_url": final_url or url,
+        "search_query": query, "source": "Google News RSS + 원문", "body_status": body_status, "body_char_count": body_char_count, "mention_type": mention_type,
         "topic": classify_topics(combined), "relevance_score": score,
         "review_status": review_status, "media_weight": TYPE_WEIGHT.get(mention_type, 0.5),
     }
@@ -307,7 +388,7 @@ def clean_existing(existing: pd.DataFrame, professors: pd.DataFrame) -> pd.DataF
     kept = []
     for _, row in existing.iterrows():
         name = str(row["professor_name"]).strip()
-        combined = f"{row['title']} {row['summary']}"
+        combined = content_text(row.get("title", ""), row.get("summary", ""), row.get("body", ""))
         row = row.copy()
         row["topic"] = classify_topics(combined)
         row["mention_type"] = classify_type(combined)
@@ -332,20 +413,32 @@ def clean_existing(existing: pd.DataFrame, professors: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(kept, columns=ARTICLE_COLUMNS) if kept else pd.DataFrame(columns=ARTICLE_COLUMNS)
 
 
-def collect(max_items: int = 100, sleep_seconds: float = 0.15) -> tuple[int, int]:
+def _entry_to_candidate(entry: dict, query: str) -> dict:
+    return {
+        "title": clean_text(entry.get("title", "")),
+        "summary": clean_text(entry.get("summary", "")),
+        "publisher": clean_text(entry.get("source", {}).get("title", "")) or "미상",
+        "published_at": parse_date(entry.get("published", "")),
+        "url": str(entry.get("link", "")).strip(),
+        "query": query,
+    }
+
+def _candidate_key(candidate: dict) -> str:
+    return candidate.get("url") or canonical_key(candidate.get("title", ""), candidate.get("published_at", ""))
+
+def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]:
     DATA_DIR.mkdir(exist_ok=True)
     professors = load_professors_file()
     existing = clean_existing(load_existing(), professors)
-    known_ids = set(existing["article_id"].astype(str))
-    rows: list[dict] = []
-    failures = 0
     collected_at = datetime.now(timezone.utc).isoformat()
+    failures = 0
 
+    professor_candidates: dict[str, dict[str, dict]] = {}
+    professor_meta: dict[str, pd.Series] = {}
     for _, professor in professors.iterrows():
         name = professor["name"].strip()
-        search_terms = [x.strip() for x in professor["search_terms"].split(";") if x.strip()]
-        exclude_terms = [x.strip() for x in professor["exclude_terms"].split(";") if x.strip()]
-        external_position = str(professor.get("external_position", "")).strip()
+        professor_meta[name] = professor
+        pool: dict[str, dict] = {}
         for query in build_queries(professor):
             try:
                 entries = fetch_feed(query, max_items=max_items)
@@ -354,26 +447,15 @@ def collect(max_items: int = 100, sleep_seconds: float = 0.15) -> tuple[int, int
                 print(f"[WARN] {name} / {query}: {exc}")
                 continue
             for entry in entries:
-                title = clean_text(entry.get("title", ""))
-                summary = clean_text(entry.get("summary", ""))
-                publisher = clean_text(entry.get("source", {}).get("title", "")) or "미상"
-                published_at = parse_date(entry.get("published", ""))
-                url = str(entry.get("link", "")).strip()
-                if not title:
+                candidate = _entry_to_candidate(entry, query)
+                if not candidate["title"] or not candidate["url"]:
                     continue
-                combined = f"{title} {summary}"
-                score, _ = relevance_score(name, combined, search_terms, exclude_terms, external_position)
-                if score < 45:
-                    continue
-                row = make_row(name, title, summary, publisher, published_at, url, query, collected_at,
-                               score, "관련" if score >= 70 else "검토 필요")
-                if row["article_id"] not in known_ids:
-                    rows.append(row)
-                    known_ids.add(row["article_id"])
+                if len(pool) < 120:
+                    pool.setdefault(_candidate_key(candidate), candidate)
             time.sleep(sleep_seconds)
+        professor_candidates[name] = pool
 
-    # 교수명이 제목·요약에 없어도 대학원 자체가 등장하는 기사 수집
-    professor_names = professors["name"].tolist()
+    institution_pool: dict[str, dict] = {}
     for query in build_institution_queries():
         try:
             entries = fetch_feed(query, max_items=max_items)
@@ -382,40 +464,79 @@ def collect(max_items: int = 100, sleep_seconds: float = 0.15) -> tuple[int, int
             print(f"[WARN] 대학원 전체 / {query}: {exc}")
             continue
         for entry in entries:
-            title = clean_text(entry.get("title", ""))
-            summary = clean_text(entry.get("summary", ""))
-            publisher = clean_text(entry.get("source", {}).get("title", "")) or "미상"
-            published_at = parse_date(entry.get("published", ""))
-            url = str(entry.get("link", "")).strip()
-            combined = f"{title} {summary}"
-            if not title or not any(term in combined for term in GSPA_TERMS):
-                continue
-            matched_names = [name for name in professor_names if name in combined]
-            validated_targets = []
-            for target in matched_names:
-                professor = professors.loc[professors["name"] == target].iloc[0]
-                terms = _split_terms(professor.get("search_terms", ""))
-                excludes = _split_terms(professor.get("exclude_terms", ""))
-                external_position = str(professor.get("external_position", "")).strip()
-                score, _ = relevance_score(target, combined, terms, excludes, external_position)
-                if score >= 45:
-                    validated_targets.append((target, score))
-            targets = validated_targets or [("대학원 전체", 100)]
-            for target, score in targets:
-                row = make_row(target, title, summary, publisher, published_at, url, query, collected_at, score, "관련")
-                if row["article_id"] not in known_ids:
-                    rows.append(row)
-                    known_ids.add(row["article_id"])
+            candidate = _entry_to_candidate(entry, query)
+            if candidate["title"] and candidate["url"] and len(institution_pool) < 180:
+                institution_pool.setdefault(_candidate_key(candidate), candidate)
         time.sleep(sleep_seconds)
 
-    updated = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True) if rows else existing
+    all_candidates: dict[str, dict] = {}
+    for pool in professor_candidates.values():
+        all_candidates.update(pool)
+    all_candidates.update(institution_pool)
+
+    extraction_cache: dict[str, dict] = {}
+    urls = [c["url"] for c in all_candidates.values() if c.get("url")]
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(resolve_and_extract_body, url): url for url in dict.fromkeys(urls)}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                extraction_cache[url] = future.result()
+            except Exception as exc:
+                extraction_cache[url] = {"final_url": url, "body": "", "body_status": f"추출 오류: {type(exc).__name__}", "body_char_count": 0}
+
+    rows: list[dict] = []
+    known_ids: set[str] = set()
+    for name, pool in professor_candidates.items():
+        professor = professor_meta[name]
+        terms = _split_terms(professor.get("search_terms", ""))
+        excludes = _split_terms(professor.get("exclude_terms", ""))
+        external_position = str(professor.get("external_position", "")).strip()
+        for candidate in pool.values():
+            ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "body_status": "미수집", "body_char_count": 0})
+            combined = content_text(candidate["title"], candidate["summary"], ext["body"])
+            score, _ = relevance_score(name, combined, terms, excludes, external_position)
+            if score < 45:
+                continue
+            row = make_row(name, candidate["title"], candidate["summary"], ext["body"], candidate["publisher"],
+                           candidate["published_at"], candidate["url"], ext["final_url"], ext["body_status"],
+                           ext["body_char_count"], candidate["query"], collected_at, score,
+                           "관련" if score >= 70 else "검토 필요")
+            if row["article_id"] not in known_ids:
+                rows.append(row); known_ids.add(row["article_id"])
+
+    professor_names = professors["name"].tolist()
+    for candidate in institution_pool.values():
+        ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "body_status": "미수집", "body_char_count": 0})
+        combined = content_text(candidate["title"], candidate["summary"], ext["body"])
+        if not any(term in combined for term in GSPA_TERMS):
+            continue
+        validated = []
+        for target in [n for n in professor_names if n in combined]:
+            professor = professor_meta[target]
+            score, _ = relevance_score(target, combined, _split_terms(professor.get("search_terms", "")),
+                                       _split_terms(professor.get("exclude_terms", "")),
+                                       str(professor.get("external_position", "")).strip())
+            if score >= 45:
+                validated.append((target, score))
+        targets = validated or [("대학원 전체", 100)]
+        for target, score in targets:
+            row = make_row(target, candidate["title"], candidate["summary"], ext["body"], candidate["publisher"],
+                           candidate["published_at"], candidate["url"], ext["final_url"], ext["body_status"],
+                           ext["body_char_count"], candidate["query"], collected_at, score, "관련")
+            if row["article_id"] not in known_ids:
+                rows.append(row); known_ids.add(row["article_id"])
+
+    fresh = pd.DataFrame(rows, columns=ARTICLE_COLUMNS) if rows else pd.DataFrame(columns=ARTICLE_COLUMNS)
+    # 기존 누적 데이터는 재검증하여 유지하고, 이번 수집에서 같은 기사를 다시 찾으면 본문 데이터로 갱신한다.
+    updated = pd.concat([existing, fresh], ignore_index=True) if not existing.empty or not fresh.empty else fresh
     if not updated.empty:
         updated = updated.drop_duplicates(subset=["article_id"], keep="last")
         updated["published_at"] = pd.to_datetime(updated["published_at"], errors="coerce", utc=True)
         updated = updated.sort_values("published_at", ascending=False, na_position="last")
         updated["published_at"] = updated["published_at"].astype(str).replace("NaT", "")
     updated.to_csv(ARTICLES_FILE, index=False, encoding="utf-8-sig")
-    return len(rows), failures
+    return len(updated), failures
 
 
 if __name__ == "__main__":
