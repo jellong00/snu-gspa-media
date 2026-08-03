@@ -161,8 +161,9 @@ today = pd.Timestamp.now(tz="Asia/Seoul").date()
 
 with st.sidebar:
     st.header("필터")
-    preset = st.radio("기간", ["오늘", "최근 7일", "최근 30일", "올해", "사용자 지정"], index=2, horizontal=True)
-    if preset == "오늘": start_date, end_date = today, today
+    preset = st.radio("기간", ["전체 기간", "오늘", "최근 7일", "최근 30일", "올해", "사용자 지정"], index=0, horizontal=True)
+    if preset == "전체 기간": start_date, end_date = min_date, max(today, max_date)
+    elif preset == "오늘": start_date, end_date = today, today
     elif preset == "최근 7일": start_date, end_date = today - pd.Timedelta(days=6), today
     elif preset == "최근 30일": start_date, end_date = today - pd.Timedelta(days=29), today
     elif preset == "올해": start_date, end_date = pd.Timestamp(today.year, 1, 1).date(), today
