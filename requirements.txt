@@ -2,8 +2,8 @@ streamlit
 pandas
 plotly
 feedparser
-requests
 beautifulsoup4
 wordcloud
 Pillow
 python-dateutil
+requests
