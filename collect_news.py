@@ -19,29 +19,32 @@ PROFESSORS_FILE = DATA_DIR / "professors.csv"
 ARTICLES_FILE = DATA_DIR / "articles.csv"
 
 ARTICLE_COLUMNS = [
-    "article_id", "professor_name", "published_at", "collected_at", "title",
-    "summary", "publisher", "url", "search_query", "mention_type", "topic",
-    "relevance_score", "review_status",
+    "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
+    "title", "summary", "publisher", "url", "search_query", "source",
+    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
 TYPE_RULES = {
-    "기고·칼럼": ["기고", "칼럼", "시론", "특별기고", "오피니언"],
-    "인터뷰": ["인터뷰", "만나다", "대담", "일문일답"],
-    "방송 출연": ["출연", "라디오", "뉴스특보", "방송", "유튜브"],
-    "연구 소개": ["연구", "논문", "보고서", "분석 결과", "조사 결과"],
-    "행사·발표": ["세미나", "포럼", "토론회", "학술대회", "발표"],
-    "인사·직책": ["임명", "취임", "선임", "원장", "수상"],
-    "전문가 인용": ["교수는", "교수는 말했다", "전문가는", "진단했다", "지적했다", "설명했다", "분석했다"],
+    "기고·칼럼": ["기고", "칼럼", "시론", "오피니언", "특별기고"],
+    "인터뷰": ["인터뷰", "대담", "일문일답", "만나봤", "초대석"],
+    "방송 출연": ["출연", "라디오", "방송", "뉴스특보", "유튜브", "영상"],
+    "전문가 인용": ["교수는", "전문가는", "진단했다", "지적했다", "설명했다", "분석했다", "전망했다", "말했다"],
+    "연구 소개": ["연구", "논문", "보고서", "조사 결과", "분석 결과", "학술지"],
+    "행사·발표": ["세미나", "포럼", "토론회", "학술대회", "발표", "강연"],
+    "인사·직책": ["임명", "취임", "선임", "원장", "수상", "위촉"],
 }
-
+TYPE_WEIGHT = {
+    "기고·칼럼": 5.0, "인터뷰": 4.0, "방송 출연": 4.0, "전문가 인용": 3.0,
+    "연구 소개": 3.0, "행사·발표": 2.0, "인사·직책": 1.0, "단순 언급": 0.5,
+}
 TOPIC_RULES = {
-    "디지털·AI": ["인공지능", "AI", "알고리즘", "전자정부", "디지털", "개인정보", "프라이버시", "정보정책"],
-    "재정·경제": ["재정", "세금", "예산", "공기업", "재벌", "기업", "경쟁정책", "공정거래", "금융", "경제"],
-    "사회·복지": ["복지", "연금", "사회정책", "인구", "저출생", "이민", "다문화", "탈북", "보건"],
+    "행정·조직": ["거버넌스", "조직", "인사", "공공관리", "정부혁신", "행정", "윤리", "정책수단"],
+    "재정·경제": ["재정", "예산", "세금", "공기업", "재벌", "기업", "공정거래", "금융", "경제", "회계"],
+    "사회·복지": ["복지", "연금", "사회정책", "인구", "저출생", "이민", "다문화", "탈북", "보건", "교육"],
     "국제·개발": ["국제", "통상", "ODA", "개발협력", "해양", "북한", "동아시아", "글로벌"],
+    "디지털·AI": ["인공지능", "AI", "알고리즘", "전자정부", "디지털", "개인정보", "프라이버시", "정보정책"],
     "환경·에너지": ["기후", "환경", "에너지", "탄소", "재해", "방재"],
     "법·안전": ["행정법", "지방자치", "범죄", "경찰", "형사", "안전", "법원", "헌법"],
-    "행정·조직": ["행정", "거버넌스", "조직", "인사", "공공관리", "정부혁신", "윤리", "정책수단"],
     "정책분석·방법론": ["정책평가", "정책분석", "계량", "방법론", "실험", "증거기반", "수요예측"],
 }
 
@@ -61,72 +64,78 @@ def parse_date(value: str) -> str:
         return ""
 
 
-def classify(text: str, rules: dict[str, list[str]], default: str) -> str:
+def classify_type(text: str) -> str:
     lowered = text.lower()
-    scores = {
-        category: sum(1 for keyword in keywords if keyword.lower() in lowered)
-        for category, keywords in rules.items()
-    }
+    scores = {category: sum(1 for keyword in words if keyword.lower() in lowered) for category, words in TYPE_RULES.items()}
     best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else default
+    return best if scores[best] else "단순 언급"
+
+
+def classify_topics(text: str) -> str:
+    lowered = text.lower()
+    matched = [category for category, words in TOPIC_RULES.items() if any(word.lower() in lowered for word in words)]
+    return ";".join(matched) if matched else "기타"
 
 
 def relevance_score(name: str, text: str, search_terms: list[str], exclude_terms: list[str]) -> int:
-    score = 0
     lowered = text.lower()
+    score = 0
     if name.lower() in lowered:
         score += 45
     if "서울대학교" in text or "서울대" in text:
-        score += 30
+        score += 25
     if "행정대학원" in text:
         score += 20
     score += min(20, 5 * sum(1 for term in search_terms if term and term.lower() in lowered))
-    score -= min(60, 30 * sum(1 for term in exclude_terms if term and term.lower() in lowered))
+    score -= min(70, 35 * sum(1 for term in exclude_terms if term and term.lower() in lowered))
+    other_university = re.search(r"(?:연세대|고려대|성균관대|한양대|중앙대|경희대|부산대|경북대|전남대|충남대)\s*(?:학교)?", text)
+    if other_university and "서울대" not in text and "서울대학교" not in text:
+        score -= 25
     return max(0, min(100, score))
 
 
 def build_queries(row: pd.Series) -> list[str]:
     name = str(row["name"]).strip()
     terms = [x.strip() for x in str(row.get("search_terms", "")).split(";") if x.strip()]
-    affiliation_query = f'"{name}" ("서울대학교" OR "서울대" OR "행정대학원")'
-    topic_part = " OR ".join(f'"{term}"' for term in terms[:4])
-    topic_query = f'"{name}" ({topic_part})' if topic_part else affiliation_query
-    return list(dict.fromkeys([affiliation_query, topic_query]))
+    affiliation = f'"{name}" ("서울대학교" OR "서울대" OR "행정대학원")'
+    topic_part = " OR ".join(f'"{term}"' for term in terms[:5])
+    topic = f'"{name}" ({topic_part})' if topic_part else affiliation
+    return list(dict.fromkeys([affiliation, topic]))
 
 
 def fetch_feed(query: str, max_items: int = 100) -> list[dict]:
-    url = (
-        "https://news.google.com/rss/search?q="
-        + quote(query)
-        + "&hl=ko&gl=KR&ceid=KR:ko"
-    )
-    feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+    url = "https://news.google.com/rss/search?q=" + quote(query) + "&hl=ko&gl=KR&ceid=KR:ko"
+    feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0 (compatible; SNU-GSPA-Media-Monitor/1.0)"})
     if getattr(feed, "bozo", False) and not feed.entries:
-        raise RuntimeError(f"RSS parsing failed: {getattr(feed, 'bozo_exception', 'unknown error')}")
+        raise RuntimeError(str(getattr(feed, "bozo_exception", "RSS parsing failed")))
     return list(feed.entries[:max_items])
 
 
-def make_article_id(professor_name: str, title: str, publisher: str, published_at: str) -> str:
-    normalized = "|".join([
-        professor_name.strip().lower(),
-        re.sub(r"\W+", "", title.lower()),
-        publisher.strip().lower(),
-        published_at[:10],
-    ])
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+def normalize_title(title: str) -> str:
+    title = re.sub(r"\s*[-|–—]\s*[^-|–—]{2,30}$", "", title)
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", title).lower()
+
+
+def canonical_key(title: str, published_at: str) -> str:
+    raw = f"{normalize_title(title)}|{published_at[:10]}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def article_id(professor_name: str, canonical: str) -> str:
+    return hashlib.sha256(f"{professor_name}|{canonical}".encode("utf-8")).hexdigest()[:24]
 
 
 def load_existing() -> pd.DataFrame:
     if not ARTICLES_FILE.exists() or ARTICLES_FILE.stat().st_size == 0:
         return pd.DataFrame(columns=ARTICLE_COLUMNS)
     df = pd.read_csv(ARTICLES_FILE, dtype=str).fillna("")
-    for column in ARTICLE_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
+    for col in ARTICLE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
     return df[ARTICLE_COLUMNS]
 
 
-def collect() -> tuple[int, int]:
+def collect(max_items: int = 100, sleep_seconds: float = 0.15) -> tuple[int, int]:
     DATA_DIR.mkdir(exist_ok=True)
     professors = pd.read_csv(PROFESSORS_FILE, dtype=str).fillna("")
     existing = load_existing()
@@ -141,50 +150,52 @@ def collect() -> tuple[int, int]:
         exclude_terms = [x.strip() for x in professor.get("exclude_terms", "").split(";") if x.strip()]
         for query in build_queries(professor):
             try:
-                entries = fetch_feed(query)
+                entries = fetch_feed(query, max_items=max_items)
             except Exception as exc:
                 failures += 1
                 print(f"[WARN] {name} / {query}: {exc}")
                 continue
-
             for entry in entries:
                 title = clean_text(entry.get("title", ""))
                 summary = clean_text(entry.get("summary", ""))
-                publisher = clean_text(entry.get("source", {}).get("title", ""))
+                publisher = clean_text(entry.get("source", {}).get("title", "")) or "미상"
                 published_at = parse_date(entry.get("published", ""))
                 url = str(entry.get("link", "")).strip()
+                if not title:
+                    continue
                 combined = f"{title} {summary}"
                 score = relevance_score(name, combined, search_terms, exclude_terms)
-                article_id = make_article_id(name, title, publisher, published_at)
-                if not title or article_id in known_ids:
+                ckey = canonical_key(title, published_at)
+                aid = article_id(name, ckey)
+                if aid in known_ids:
                     continue
-
+                mention_type = classify_type(combined)
                 rows.append({
-                    "article_id": article_id,
+                    "article_id": aid,
+                    "canonical_key": ckey,
                     "professor_name": name,
                     "published_at": published_at,
                     "collected_at": collected_at,
                     "title": title,
                     "summary": summary,
-                    "publisher": publisher or "미상",
+                    "publisher": publisher,
                     "url": url,
                     "search_query": query,
-                    "mention_type": classify(combined, TYPE_RULES, "단순 언급"),
-                    "topic": classify(combined, TOPIC_RULES, "기타"),
+                    "source": "Google News RSS",
+                    "mention_type": mention_type,
+                    "topic": classify_topics(combined),
                     "relevance_score": score,
                     "review_status": "관련" if score >= 70 else ("검토 필요" if score >= 45 else "제외 후보"),
+                    "media_weight": TYPE_WEIGHT.get(mention_type, 0.5),
                 })
-                known_ids.add(article_id)
-            time.sleep(0.35)
+                known_ids.add(aid)
+            time.sleep(sleep_seconds)
 
-    if rows:
-        updated = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True)
+    updated = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True) if rows else existing
+    if not updated.empty:
         updated["published_at"] = pd.to_datetime(updated["published_at"], errors="coerce", utc=True)
         updated = updated.sort_values("published_at", ascending=False, na_position="last")
         updated["published_at"] = updated["published_at"].astype(str).replace("NaT", "")
-    else:
-        updated = existing
-
     updated.to_csv(ARTICLES_FILE, index=False, encoding="utf-8-sig")
     return len(rows), failures
 
