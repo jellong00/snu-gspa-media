@@ -51,8 +51,8 @@ def load_professors(path):
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "publisher", "url", "search_query", "source",
-    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
+    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
 def load_articles_file(path):
@@ -101,7 +101,7 @@ def download_korean_font():
 
 def keyword_table(df, professor):
     rows = []
-    for idx, text in enumerate((df["title"] + " " + df["summary"]).fillna("")):
+    for idx, text in enumerate((df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["body"].fillna(""))):
         words = [w for w in re.findall(r"[가-힣A-Za-z]{2,}", text) if w not in STOPWORDS and w.lower() != professor.lower()]
         rows.extend((idx, word) for word in words)
     if not rows:
