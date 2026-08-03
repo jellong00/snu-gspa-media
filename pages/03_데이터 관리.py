@@ -47,7 +47,7 @@ def load_professors(path):
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "title", "summary", "body", "author", "metadata_text", "publisher", "url", "final_url", "search_query", "source",
     "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
