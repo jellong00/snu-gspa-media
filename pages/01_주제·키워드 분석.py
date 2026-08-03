@@ -50,8 +50,8 @@ def load_professors(path):
 
 ARTICLE_COLUMNS = [
     "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
-    "title", "summary", "publisher", "url", "search_query", "source",
-    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
+    "title", "summary", "body", "publisher", "url", "final_url", "search_query", "source",
+    "body_status", "body_char_count", "mention_type", "topic", "relevance_score", "review_status", "media_weight",
 ]
 
 def load_articles_file(path):
@@ -99,7 +99,7 @@ def download_korean_font():
 def keyword_table(df, names):
     rows = []
     names = set(names)
-    for idx, text in enumerate((df["title"] + " " + df["summary"]).fillna("")):
+    for idx, text in enumerate((df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["body"].fillna(""))):
         words = [w for w in re.findall(r"[가-힣A-Za-z]{2,}", text) if w not in STOPWORDS and w not in names]
         rows.extend((idx, word) for word in words)
     if not rows: return pd.DataFrame(columns=["키워드", "빈도", "관련 기사 수"])
@@ -152,6 +152,6 @@ with table_col:
 
 if not kw.empty:
     selected_keyword = st.selectbox("월별 추이를 볼 키워드", kw["키워드"].head(40).tolist())
-    matched = df[(df["title"] + " " + df["summary"]).str.contains(re.escape(selected_keyword), case=False, na=False)].copy()
+    matched = df[(df["title"].fillna("") + " " + df["summary"].fillna("") + " " + df["body"].fillna("")).str.contains(re.escape(selected_keyword), case=False, na=False)].copy()
     trend = matched.assign(month=matched["published_at"].dt.to_period("M").astype(str)).groupby("month")["canonical_key"].nunique().reset_index(name="기사 수")
     st.plotly_chart(px.line(trend, x="month", y="기사 수", markers=True, title=f"‘{selected_keyword}’ 월별 언급 추이"), use_container_width=True)
