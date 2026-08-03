@@ -1,5 +1,9 @@
 from pathlib import Path
+import os
 import re
+import tempfile
+
+import requests
 
 import pandas as pd
 import plotly.express as px
@@ -11,19 +15,88 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 STOPWORDS = {"교수", "서울대", "서울대학교", "행정대학원", "기자", "뉴스", "정부", "관련", "대해", "통해", "이번", "대한", "말했다", "밝혔다", "위해", "있는", "한다", "에서", "으로", "하고"}
 MAJOR_MEDIA = {"연합뉴스", "KBS", "MBC", "SBS", "JTBC", "YTN", "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "한국일보", "매일경제", "한국경제", "서울신문", "국민일보"}
 
+PROFESSOR_COLUMNS = [
+    "professor_id", "name_en", "name", "rank", "position", "status",
+    "external_position", "research_areas", "research_categories",
+    "search_terms", "exclude_terms",
+]
+PROFESSOR_ALIASES = {
+    "name_ko": "name",
+    "직급": "rank",
+    "보직": "position",
+    "재직상태": "status",
+    "외부직책": "external_position",
+    "research_area": "research_areas",
+    "연구분야": "research_areas",
+    "research_category": "research_categories",
+    "연구분야대분류": "research_categories",
+}
+
+def load_professors(path):
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    for old, new in PROFESSOR_ALIASES.items():
+        if old in df.columns and new not in df.columns:
+            df[new] = df[old]
+    for col in PROFESSOR_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    if not df["research_categories"].astype(str).str.strip().any():
+        df["research_categories"] = "기타"
+    else:
+        df["research_categories"] = df["research_categories"].replace("", "기타")
+    if not df["name"].astype(str).str.strip().any():
+        raise ValueError("professors.csv에 교수명 열(name 또는 name_ko)이 없습니다.")
+    return df[PROFESSOR_COLUMNS]
+
+ARTICLE_COLUMNS = [
+    "article_id", "canonical_key", "professor_name", "published_at", "collected_at",
+    "title", "summary", "publisher", "url", "search_query", "source",
+    "mention_type", "topic", "relevance_score", "review_status", "media_weight",
+]
+
+def load_articles_file(path):
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    for col in ARTICLE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[ARTICLE_COLUMNS]
+
 @st.cache_data(ttl=300)
 def load_data():
-    p = pd.read_csv(BASE_DIR / "data" / "professors.csv", dtype=str).fillna("")
-    a = pd.read_csv(BASE_DIR / "data" / "articles.csv", dtype=str).fillna("")
+    p = load_professors(BASE_DIR / "data" / "professors.csv")
+    a = load_articles_file(BASE_DIR / "data" / "articles.csv")
     a["published_at"] = pd.to_datetime(a["published_at"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
     a["media_weight"] = pd.to_numeric(a["media_weight"], errors="coerce").fillna(0.5)
     a["relevance_score"] = pd.to_numeric(a["relevance_score"], errors="coerce").fillna(0)
     return p, a
 
 
-def font_path():
-    candidates = ["/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc"]
-    return next((p for p in candidates if Path(p).exists()), None)
+FONT_URLS = [
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
+]
+
+
+@st.cache_resource
+def download_korean_font():
+    """시스템 패키지 없이 실행 시점에 한글 TTF를 임시 폴더로 내려받는다."""
+    font_path = os.path.join(tempfile.gettempdir(), "NanumGothic-Regular.ttf")
+    if os.path.exists(font_path) and os.path.getsize(font_path) > 100_000:
+        return font_path
+    for url in FONT_URLS:
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            if len(response.content) < 100_000:
+                continue
+            with open(font_path, "wb") as file:
+                file.write(response.content)
+            return font_path
+        except (requests.RequestException, OSError):
+            continue
+    return None
 
 
 def keyword_table(df, professor):
@@ -90,12 +163,12 @@ kw = keyword_table(df, name).head(50)
 st.subheader("주요 키워드")
 wc_col, table_col = st.columns([1.25, 1])
 with wc_col:
-    fp = font_path()
+    fp = download_korean_font()
     if not kw.empty and fp:
         wc = WordCloud(width=1000, height=520, background_color="white", font_path=fp, collocations=False).generate_from_frequencies(dict(zip(kw["키워드"], kw["빈도"])))
         st.image(wc.to_array(), use_container_width=True)
     elif not kw.empty:
-        st.warning("한글 글꼴을 찾지 못했습니다.")
+        st.warning("한글 폰트를 내려받지 못해 워드클라우드를 표시하지 못했습니다. 잠시 후 다시 실행하십시오.")
 with table_col:
     st.dataframe(kw.head(20), hide_index=True, use_container_width=True)
 if not kw.empty:
