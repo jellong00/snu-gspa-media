@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="기사 탐색", page_icon="📄", layout="wide")
+st.set_page_config(page_title="기사 검색", page_icon="📄", layout="wide")
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 @st.cache_data(ttl=300)
