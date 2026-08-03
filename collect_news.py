@@ -29,7 +29,7 @@ ARTICLE_COLUMNS = [
 PROFESSOR_COLUMNS = [
     "professor_id", "name_en", "name", "rank", "position", "status",
     "external_position", "research_areas", "research_categories",
-    "search_terms", "exclude_terms", "strict_affiliation",
+    "search_terms", "exclude_terms", "known_affiliations", "strict_affiliation",
 ]
 PROFESSOR_ALIASES = {
     "name_ko": "name", "research_area": "research_areas",
@@ -148,15 +148,18 @@ def _split_terms(value: str) -> list[str]:
     return [x.strip() for x in str(value or "").split(";") if x.strip()]
 
 
-def _allowed_external_terms(external_position: str) -> list[str]:
-    text = str(external_position or "").strip()
-    if not text:
-        return []
-    terms = [text]
-    # "한국행정연구원 원장"처럼 기관명만으로도 확인할 수 있게 직책어를 제거한다.
-    institution = re.sub(r"\s*(원장|소장|센터장|위원장|교수|이사장|대표|주임).*$", "", text).strip()
-    if len(institution) >= 3:
-        terms.append(institution)
+def _allowed_external_terms(external_position: str, known_affiliations: str = "") -> list[str]:
+    """CSV에 등록된 현재·과거 외부직책 및 별도 소속 단서를 반환한다."""
+    raw_values = _split_terms(external_position) + _split_terms(known_affiliations)
+    terms: list[str] = []
+    for text in raw_values:
+        text = str(text or "").strip()
+        if not text:
+            continue
+        terms.append(text)
+        institution = re.sub(r"\s*(원장|소장|센터장|위원장|위원|교수|이사장|대표|주임).*$", "", text).strip()
+        if len(institution) >= 3:
+            terms.append(institution)
     return list(dict.fromkeys(terms))
 
 
@@ -165,6 +168,7 @@ def affiliation_match(
     text: str,
     search_terms: list[str],
     external_position: str = "",
+    known_affiliations: str = "",
 ) -> tuple[bool, str]:
     """모든 교수에게 동일한 소속 검증을 적용한다.
 
@@ -179,8 +183,18 @@ def affiliation_match(
         return False, "교수명 없음"
 
     has_gspa = any(term.lower() in near_lower for term in GSPA_TERMS)
-    allowed_external = _allowed_external_terms(external_position)
+    allowed_external = _allowed_external_terms(external_position, known_affiliations)
     has_allowed_external = any(term.lower() in near_lower for term in allowed_external)
+
+    # "고길곤 서울대 교수", "서울대 교수 고길곤", "서울대 고길곤 교수"처럼
+    # 행정대학원 명칭이 생략된 통상적인 언론 표기도 명확한 긍정 근거로 인정한다.
+    escaped_name = re.escape(name)
+    snu_professor_patterns = [
+        rf"{escaped_name}\s*(?:서울대학교|서울대)\s*교수",
+        rf"(?:서울대학교|서울대)\s*교수\s*{escaped_name}",
+        rf"(?:서울대학교|서울대)\s*{escaped_name}\s*교수",
+    ]
+    has_snu_professor = any(re.search(pattern, near, flags=re.IGNORECASE) for pattern in snu_professor_patterns)
 
     has_snu_near = "서울대" in near or "서울대학교" in near
     academic_hits = sum(
@@ -198,7 +212,16 @@ def affiliation_match(
     if organization_pattern.search(near) and not has_allowed_external:
         other_org_near = True
 
-    # 등록된 실제 외부직책은 허용한다. 그 외 다른 대학·단과대·기관 소속은 제외한다.
+    # 명시적인 행정대학원·서울대 교수 표기 또는 등록된 실제 외부직책은 우선 인정한다.
+    # 같은 기사에 다른 기관 인사가 함께 언급돼도 해당 교수의 명확한 소속 근거가 있으면 제외하지 않는다.
+    if has_gspa:
+        return True, "행정대학원 소속 확인"
+    if has_snu_professor:
+        return True, "서울대 교수 소속 확인"
+    if has_allowed_external:
+        return True, "등록된 현재·과거 외부직책 확인"
+
+    # 명확한 긍정 근거가 없을 때만 다른 대학·단과대·기관 소속을 배제한다.
     if not has_gspa and not has_allowed_external:
         if other_univ_near:
             return False, "다른 대학 소속"
@@ -207,10 +230,6 @@ def affiliation_match(
         if other_org_near:
             return False, "다른 기업·연구원·기관·직업 소속"
 
-    if has_gspa:
-        return True, "행정대학원 소속 확인"
-    if has_allowed_external:
-        return True, "등록된 외부직책 확인"
     if has_snu_near and academic_hits >= 1:
         return True, "서울대 및 행정·정책 전공 근거 확인"
     return False, "행정대학원 소속 근거 부족"
@@ -222,9 +241,10 @@ def relevance_score(
     search_terms: list[str],
     exclude_terms: list[str],
     external_position: str = "",
+    known_affiliations: str = "",
 ) -> tuple[int, str]:
     lowered = text.lower()
-    valid, reason = affiliation_match(name, text, search_terms, external_position)
+    valid, reason = affiliation_match(name, text, search_terms, external_position, known_affiliations)
     if not valid:
         return 0, reason
     score = 40
@@ -232,8 +252,12 @@ def relevance_score(
         score += 15
     if "행정대학원" in text:
         score += 35
-    if any(term.lower() in nearby_text(name, text, radius=220).lower() for term in _allowed_external_terms(external_position)):
-        score += 25
+    # 명시적인 "서울대 교수" 표기와 등록된 외부직책은 기본 화면에서 숨겨지지 않도록
+    # 관련 기사 기준(70점) 이상을 부여한다.
+    if reason == "서울대 교수 소속 확인":
+        score += 20
+    if any(term.lower() in nearby_text(name, text, radius=220).lower() for term in _allowed_external_terms(external_position, known_affiliations)):
+        score += 35
     score += min(15, 3 * sum(1 for term in search_terms if term and term.lower() in lowered))
     score -= min(80, 40 * sum(1 for term in exclude_terms if term and term.lower() in lowered))
     return max(0, min(100, score)), reason
@@ -247,6 +271,20 @@ def build_queries(row: pd.Series) -> list[str]:
     topic = f'"{name}" ("서울대학교" OR "서울대") ({topic_part})' if topic_part else affiliation
     broad = f'"{name}"'
     return list(dict.fromkeys([affiliation, topic, broad]))
+
+
+def build_backfill_queries(row: pd.Series, start_year: int = 2018) -> list[str]:
+    """검색 결과 상위 몇 건에 밀린 과거 기사를 연도별로 다시 찾는다.
+
+    Google 일반 검색과 News RSS 결과 범위가 다르므로, 해당 교수의 누적 데이터가
+    한 건도 없을 때만 연도별 검색을 수행한다.
+    """
+    name = str(row["name"]).strip()
+    current_year = datetime.now(timezone.utc).year
+    return [
+        f'"{name}" ("서울대" OR "서울대학교" OR "행정대학원") after:{year}-01-01 before:{year + 1}-01-01'
+        for year in range(start_year, current_year + 1)
+    ]
 
 
 def build_institution_queries() -> list[str]:
@@ -405,7 +443,8 @@ def clean_existing(existing: pd.DataFrame, professors: pd.DataFrame) -> pd.DataF
         terms = [x.strip() for x in str(professor["search_terms"]).split(";") if x.strip()]
         excludes = [x.strip() for x in str(professor["exclude_terms"]).split(";") if x.strip()]
         external_position = str(professor.get("external_position", "")).strip()
-        score, _ = relevance_score(name, combined, terms, excludes, external_position)
+        known_affiliations = str(professor.get("known_affiliations", "")).strip()
+        score, _ = relevance_score(name, combined, terms, excludes, external_position, known_affiliations)
         row["relevance_score"] = score
         row["review_status"] = "관련" if score >= 70 else ("검토 필요" if score >= 45 else "제외 후보")
         if score >= 45:
@@ -439,7 +478,12 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
         name = professor["name"].strip()
         professor_meta[name] = professor
         pool: dict[str, dict] = {}
-        for query in build_queries(professor):
+        existing_counts = existing["professor_name"].astype(str).value_counts().to_dict() if not existing.empty else {}
+        queries = build_queries(professor)
+        # 누적 기사가 거의 없는 교수는 과거 기사도 연도별로 보강한다.
+        if int(existing_counts.get(name, 0)) < 5:
+            queries += build_backfill_queries(professor)
+        for query in list(dict.fromkeys(queries)):
             try:
                 entries = fetch_feed(query, max_items=max_items)
             except Exception as exc:
@@ -450,7 +494,7 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
                 candidate = _entry_to_candidate(entry, query)
                 if not candidate["title"] or not candidate["url"]:
                     continue
-                if len(pool) < 120:
+                if len(pool) < 500:
                     pool.setdefault(_candidate_key(candidate), candidate)
             time.sleep(sleep_seconds)
         professor_candidates[name] = pool
@@ -492,10 +536,11 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
         terms = _split_terms(professor.get("search_terms", ""))
         excludes = _split_terms(professor.get("exclude_terms", ""))
         external_position = str(professor.get("external_position", "")).strip()
+        known_affiliations = str(professor.get("known_affiliations", "")).strip()
         for candidate in pool.values():
             ext = extraction_cache.get(candidate["url"], {"final_url": candidate["url"], "body": "", "body_status": "미수집", "body_char_count": 0})
             combined = content_text(candidate["title"], candidate["summary"], ext["body"])
-            score, _ = relevance_score(name, combined, terms, excludes, external_position)
+            score, _ = relevance_score(name, combined, terms, excludes, external_position, known_affiliations)
             if score < 45:
                 continue
             row = make_row(name, candidate["title"], candidate["summary"], ext["body"], candidate["publisher"],
@@ -516,7 +561,8 @@ def collect(max_items: int = 60, sleep_seconds: float = 0.05) -> tuple[int, int]
             professor = professor_meta[target]
             score, _ = relevance_score(target, combined, _split_terms(professor.get("search_terms", "")),
                                        _split_terms(professor.get("exclude_terms", "")),
-                                       str(professor.get("external_position", "")).strip())
+                                       str(professor.get("external_position", "")).strip(),
+                                       str(professor.get("known_affiliations", "")).strip())
             if score >= 45:
                 validated.append((target, score))
         targets = validated or [("대학원 전체", 100)]
